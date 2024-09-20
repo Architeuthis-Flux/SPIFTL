@@ -50,11 +50,15 @@ public:
     virtual bool eraseBlock(int eb) override {
         if (eb < _flashSize / ebBytes) {
             const uint8_t *addr = _flash + (eb * ebBytes);
-            noInterrupts();
+            if (!__isFreeRTOS) {
+                noInterrupts();
+            }
             rp2040.idleOtherCore();
             flash_range_erase((intptr_t)addr - (intptr_t)XIP_BASE, ebBytes);
             rp2040.resumeOtherCore();
-            interrupts();
+            if (!__isFreeRTOS) {
+                interrupts();
+            }
             return true;
         }
         return false;
@@ -63,11 +67,15 @@ public:
     virtual bool program(int eb, int offset, const void *data, int size) override {
         if (eb < _flashSize / ebBytes) {
             const uint8_t *addr = _flash + (eb * ebBytes + offset);
-            noInterrupts();
+            if (!__isFreeRTOS) {
+                noInterrupts();
+            }
             rp2040.idleOtherCore();
             flash_range_program((intptr_t)addr - (intptr_t)XIP_BASE, (const uint8_t *)data, size);
             rp2040.resumeOtherCore();
-            interrupts();
+            if (!__isFreeRTOS) {
+                interrupts();
+            }
             return true;
         }
         return false;
