@@ -26,3 +26,10 @@ valgrind:
 statictest:
 	g++ -g -o0 -o staticwearleveltest staticwearleveltest.cpp
 	./staticwearleveltest
+
+# Delta-journal crash-recovery / durability tests. SPIFTL_RAM_STRICT makes the
+# RAM flash emulator model real NOR (erase -> 0xFF, program can only clear
+# bits) so a "program over a non-erased page" bug is caught.
+journaltest:
+	g++ -std=c++17 -g -O0 -DSPIFTL_RAM_STRICT -o journaltest journaltest.cpp
+	./journaltest

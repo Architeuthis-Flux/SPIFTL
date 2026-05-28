@@ -29,6 +29,15 @@ public:
         _flash = new uint8_t[_flashSize];
         _isErased = new uint8_t[_flashSize / ebBytes];
         bzero(_isErased, _flashSize / ebBytes);
+        // Model a blank chip: every cell starts in the erased state. (Without
+        // this the buffer is uninitialized heap, which makes crash-recovery
+        // tests non-deterministic - a fresh instance could observe a prior
+        // run's freed image.) deserialize() overrides this if a file exists.
+#ifdef SPIFTL_RAM_STRICT
+        memset(_flash, 0xff, _flashSize);
+#else
+        bzero(_flash, _flashSize);
+#endif
     }
 
     virtual ~FlashInterfaceRAM() override {
@@ -75,7 +84,12 @@ public:
         }
         _isErased[eb] = 1;
         if (eb < _flashSize / ebBytes) {
+#ifdef SPIFTL_RAM_STRICT
+            // Model real NOR: an erased cell reads as all-ones (0xFF).
+            memset(&_flash[eb * ebBytes], 0xff, ebBytes);
+#else
             bzero(&_flash[eb * ebBytes], ebBytes);
+#endif
             return true;
         }
         return false;
@@ -83,12 +97,39 @@ public:
 
     virtual bool program(int eb, int offset, const void *data, int size) override {
         if (eb < _flashSize / ebBytes) {
+#ifdef SPIFTL_RAM_STRICT
+            // Real NOR flash can only clear bits (1 -> 0) on program; setting a
+            // bit requires an erase first. Model that (stored &= data) and flag
+            // any attempt to set a bit, so tests catch a "program over a non-
+            // erased page" bug (a journal append that forgot to erase, a
+            // miscomputed write cursor, double-programming the same page, ...).
+            const uint8_t *src = (const uint8_t *)data;
+            uint8_t *dst = &_flash[eb * ebBytes + offset];
+            for (int i = 0; i < size; i++) {
+                if ((dst[i] & src[i]) != src[i]) {
+                    if (_norViolations < 20) {
+                        fprintf(stderr,
+                                "NOR VIOLATION: program eb %d off %d: cannot set bits 0x%02x over 0x%02x\n",
+                                eb, offset + i, src[i], dst[i]);
+                    }
+                    _norViolations++;
+                }
+                dst[i] &= src[i];
+            }
+            _isErased[eb] = 0;
+            return true;
+#else
             _isErased[eb] = 0;
             memcpy(&_flash[eb * ebBytes + offset], data, size);
             return true;
+#endif
         }
         return false;
     }
+
+#ifdef SPIFTL_RAM_STRICT
+    int norViolations() const { return _norViolations; }
+#endif
 
     virtual bool read(int eb, int offset, void *data, int size) override {
         if (eb < _flashSize / ebBytes) {
@@ -103,4 +144,7 @@ private:
     int _flashSize;
     uint8_t *_flash;
     uint8_t *_isErased;
+#ifdef SPIFTL_RAM_STRICT
+    int _norViolations = 0;
+#endif
 };

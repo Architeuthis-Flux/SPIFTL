@@ -38,7 +38,16 @@
 
 class SPIFTL {
 public:
-    SPIFTL(FlashInterface *fi) : _fi(fi) {
+    // `journal` opts in to the append-only delta-journal (see "DELTA JOURNAL"
+    // section below). Crucially the on-flash GEOMETRY is identical whether or
+    // not journaling is on: flashLBAs is the upstream value, and the journal
+    // ring is carved opportunistically out of the normal free-block pool at
+    // runtime (and released back under near-full pressure). That means a
+    // journal-on build mounts an existing journal-off volume - and vice versa -
+    // with NO reformat and no data loss. `journal` only controls whether the
+    // dirty-tracking bitsets are allocated and the append fast-path is used;
+    // it costs nothing (geometry or memory) when off.
+    SPIFTL(FlashInterface *fi, bool journal = false) : _fi(fi), _journal(journal) {
         flashBytes = fi->size();
         assert(flashBytes <= 16 * 1024 * 1024); // We assume 16MB or less flash space with certain bitfields
         eraseBlocks = flashBytes / ebBytes;
@@ -52,9 +61,20 @@ public:
         metaEBList = new int16_t[metaEBs];
         l2p = new L2P[flashLBAs];
         metadataEBList.reserve(metaEBs); // Guarantee it can fit the list and avoid any memory allocations during FTL persistence
+        for (int i = 0; i < journalEBs; i++) {
+            journalEBList[i] = -1;
+        }
+        if (_journal) {
+            dirtyL2P = new uint8_t[(flashLBAs + 7) / 8];
+            dirtyPe = new uint8_t[(eraseBlocks + 7) / 8];
+            bzero(dirtyL2P, (flashLBAs + 7) / 8);
+            bzero(dirtyPe, (eraseBlocks + 7) / 8);
+        }
     };
 
     ~SPIFTL() {
+        delete[] dirtyPe;
+        delete[] dirtyL2P;
         delete[] l2p;
         delete[] metaEBList;
         delete[] ebState;
@@ -77,6 +97,13 @@ public:
         return peCount[eb];
     }
 
+    // Introspection (mainly for tests / diagnostics).
+    inline uint32_t debugEpoch() const { return metadataEpoch; }
+    inline int debugJournalRecords() const { return (int)journalSeq; }
+    inline int debugJournalEB(int i) const { return (i >= 0 && i < journalEBs) ? journalEBList[i] : -1; }
+    inline bool debugJournalSuspended() const { return journalSuspended; }
+    inline int debugEmptyEBs() const { return emptyEBs; }
+
     bool format() {
 #if FTL_DEBUG
         printf("formatting FTL\n");
@@ -93,6 +120,17 @@ public:
             metaEBList[i] = i;
         }
         metadataAge = 0;
+        if (_journal) {
+            // The ring + base snapshot are established lazily by the first
+            // persist() (which routes to doFullSnapshot while journalBaseValid
+            // is false), so a freshly formatted FTL has no journal markers yet.
+            for (int i = 0; i < journalEBs; i++) journalEBList[i] = -1;
+            journalSeq = 0;
+            journalBaseValid = false;
+            journalNeedsSnapshot = false;
+            journalSuspended = false;
+            clearDirty();
+        }
         // Blow away anything that looks like old metadata!
         for (int i = 0; i < eraseBlocks; i++) {
             const uint8_t *eb = _fi->readEB(i);
@@ -169,6 +207,28 @@ public:
             printf("restored metadata from flash\n");
 #endif
             metadataAge = 0;
+            if (_journal) {
+                clearDirty();
+                journalSuspended = false;
+                int found = scanJournalList(); // locate the ring from ebState markers
+                if (found > 0) {
+                    replayJournal();           // apply delta records up to the torn tail
+                    recomputeDerivedState();   // rebuild ebState valid counts from L2P
+                    journalBaseValid = true;
+                    journalNeedsSnapshot = false;
+#if FTL_DEBUG
+                    printf("journal replayed %d records from %d ring EBs\n", (int)journalSeq, found);
+#endif
+                } else {
+                    // Volume predates journaling (an existing journal-off FS) or
+                    // the ring was released. Establish a ring now if there's
+                    // room; doFullSnapshot() leaves us suspended (full-snapshot
+                    // mode) if the volume is too full. Either way: no reformat,
+                    // existing data is preserved (geometry is identical).
+                    journalBaseValid = false;
+                    doFullSnapshot();
+                }
+            }
             return true;
         } else {
             return format();
@@ -176,17 +236,96 @@ public:
     }
 
     bool persist() {
+        // Lazy mode: data bytes are already on flash via SPIFTL::write() (the
+        // _fi->program() call inside that function). What we are skipping
+        // here is only the L2P / peCount / ebState metadata serialization
+        // into the metadata erase blocks - that is what dominates the
+        // ~750 ms freeze on a 4 MB partition. The embedder is expected to
+        // call forceSync() during a real idle window (or before USB MSC
+        // mount, slot switch, shutdown) to coalesce many lazy writes into
+        // one persist.
+        //
+        // Power-loss safety: on reboot we revert to the most recently
+        // persisted L2P. Bytes written between the last forceSync() and
+        // the power cut are still physically on flash but unreachable
+        // through the L2P, so they appear as if the writes never happened.
+        // The embedder is responsible for any per-file mirror / boot-
+        // recovery scheme it wants on top.
+        if (_lazyPersist) {
+            return true;
+        }
+        // Journal mode: append a small delta record instead of rewriting the
+        // whole metadata snapshot. This is the fast path (one already-erased
+        // page program, no erase) that makes every f_close cheap AND durable.
+        if (_journal) {
+            return journalPersist();
+        }
         bool ret = doPersist();
         _fi->serialize();
         return ret;
     }
 
     bool persistIfDirty() {
+        if (_journal) {
+            // Persist if anything changed, a snapshot is pending, or no base
+            // exists yet (and we're not deliberately suspended - a suspended
+            // FTL's last snapshot is already durable).
+            if (dirtyL2Pcount || dirtyPecount || journalNeedsSnapshot ||
+                (!journalBaseValid && !journalSuspended)) {
+                return persist();
+            }
+            return false;
+        }
         if (metadataAge) {
             return persist();
         }
         return false;
     }
+
+    // Always persist regardless of lazy mode. This is the explicit
+    // "I really mean it" sync that the embedder calls during idle / slot
+    // switch / pre-USB-MSC-mount / shutdown. Returns true if metadata is
+    // (now) coherent on flash, false if the underlying flush failed.
+    bool forceSync() {
+        if (_journal) {
+            if (!dirtyL2Pcount && !dirtyPecount && !journalNeedsSnapshot &&
+                (journalBaseValid || journalSuspended)) {
+                // Nothing changed since the last persist and metadata is
+                // already durable (ring base, or last full snapshot). No-op.
+                return true;
+            }
+            return journalPersist();
+        }
+        if (!metadataAge) {
+            // Nothing has been written since the last persist; the on-flash
+            // metadata is still authoritative. No-op success.
+            return true;
+        }
+        bool ret = doPersist();
+        _fi->serialize();
+        return ret;
+    }
+
+    // Opt-in lazy persist. When enabled, persist() (which FatFS calls on
+    // every CTRL_SYNC, i.e. every f_close) becomes a no-op and the
+    // embedder is responsible for invoking forceSync() at coarse-grained
+    // safe points. Default off, so existing consumers see no behavior
+    // change. Memory cost: 1 byte.
+    void setLazyPersist(bool enable) { _lazyPersist = enable; }
+    bool isLazyPersist() const { return _lazyPersist; }
+
+    // Opt-in delta-journal. Can only be ENABLED if the instance was
+    // constructed with journaling reserved (geometry + dirty bitsets);
+    // calling setJournal(true) on a non-reserved instance is ignored so we
+    // never journal without a reserved region. Disabling is always allowed
+    // and reverts persist()/forceSync() to full snapshots.
+    void setJournal(bool enable) {
+        if (enable && !dirtyL2P) {
+            return; // Not reserved at construction; cannot enable.
+        }
+        _journal = enable;
+    }
+    bool isJournal() const { return _journal; }
 
     bool write(int lba, const uint8_t *data) {
         if ((lba < 0) || (lba >= flashLBAs)) {
@@ -212,6 +351,7 @@ public:
         }
         setLBAValid(openEB);
         setLBA(lba, openEB, openEBNextIndex);
+        markL2P(lba);
         openEBNextIndex++;
         if (openEBNextIndex >= ebBytes / lbaBytes) {
             openEB = -1;
@@ -251,6 +391,7 @@ public:
 #endif
             }
             l2p[lba] = 0; // invalid
+            markL2P(lba);
             ageMetadata();
         }
         return true;
@@ -293,8 +434,10 @@ private:
     } FTLInfo;
 
     uint8_t *peCount; // We'll just track up to 250, and when we hit 251 we will subtract maxPEDiff from them all
-    // ebState: 0 = free, 1...8 = # of LBAs valid, 9..0xe = undefined, 0xf = meta
+    // ebState: 0 = free, 1...8 = # of LBAs valid, 9..0xd = undefined,
+    //          0xe = delta-journal block, 0xf = meta
     const unsigned int ebMeta = 0x0f;
+    const unsigned int ebJournal = 0x0e;
     uint8_t *ebState;
     int16_t *metaEBList;
 
@@ -315,6 +458,72 @@ private:
 
     int openEB = -1; // EB currently being written.  < 0 == none open
     int openEBNextIndex = 0; // Which LBA w/in that EBA should be written next
+
+    // When true, persist() is a no-op and the embedder must call
+    // forceSync() at coarse-grained safe points to actually serialize
+    // metadata to flash. See setLazyPersist() / forceSync() above.
+    bool _lazyPersist = false;
+
+    // ---- DELTA JOURNAL STATE (only used when _journal is true)
+    //
+    // The journal is an append-only ring of `journalEBs` erase blocks. Each
+    // persist() programs exactly one already-erased page (flashWriteBufferSize
+    // bytes) holding the L2P / peCount entries that changed since the previous
+    // record, plus a CRC. No erase is performed on the hot path, so a persist
+    // is ~one page-program (sub-millisecond) instead of the full ~16 KB
+    // snapshot rewrite (~750 ms). A full snapshot is taken (and the journal
+    // ring reset) only when the ring fills, when a single delta is too large
+    // to fit in one page, or when bookkeeping that a delta can't capture moves
+    // (peCount rebase, metadata EB relocation).
+    bool _journal;                      // journaling enabled (dirty bitsets allocated, append used)
+    static const int journalEBs = 2;    // erase blocks used by the ring (carved from the free pool)
+    int16_t journalEBList[journalEBs];  // physical EBs of the ring, ascending; -1 if unused
+    uint32_t journalSeq = 0;            // next record/page number within this snapshot cycle
+    bool journalBaseValid = false;      // a base snapshot + ring exist on flash
+    bool journalNeedsSnapshot = false;  // a non-delta-able change happened; snapshot next persist
+    bool journalSuspended = false;      // ring released under near-full pressure; full-snapshot mode
+    uint8_t *dirtyL2P = nullptr;        // bitset[flashLBAs]: L2P entries changed since last record
+    uint8_t *dirtyPe = nullptr;         // bitset[eraseBlocks]: peCount entries changed since last record
+    int dirtyL2Pcount = 0;
+    int dirtyPecount = 0;
+    const char journalSig[4] = {'J', 'R', 'N', 'L'};
+
+    // The ring is carved from the same free-block pool that GC and metadata
+    // rotation draw on, so when the volume gets near-full we must hand those
+    // blocks back or selectBestEB()'s "keep >=3 empty" loop could never reach
+    // its target (the journal would be hogging blocks GC needs). We therefore
+    // suspend (release the ring, fall back to full-snapshot persist) when free
+    // blocks drop to journalSuspendBelow, and only re-establish the ring once
+    // free blocks recover past journalResumeAbove. The hysteresis gap avoids
+    // thrashing right at the boundary. These are erase-block counts.
+    static const int journalSuspendBelow = journalEBs + 3; // <= this many free -> release ring
+    static const int journalResumeAbove  = journalEBs + 8; // >= this many free -> rebuild ring
+
+    inline void markL2P(int lba) {
+        if (!_journal || !dirtyL2P) return;
+        if (!(dirtyL2P[lba >> 3] & (1 << (lba & 7)))) {
+            dirtyL2P[lba >> 3] |= (1 << (lba & 7));
+            dirtyL2Pcount++;
+        }
+    }
+    inline void markPe(int eb) {
+        if (!_journal || !dirtyPe) return;
+        if (!(dirtyPe[eb >> 3] & (1 << (eb & 7)))) {
+            dirtyPe[eb >> 3] |= (1 << (eb & 7));
+            dirtyPecount++;
+        }
+    }
+    inline bool testL2P(int lba) { return dirtyL2P[lba >> 3] & (1 << (lba & 7)); }
+    inline bool testPe(int eb) { return dirtyPe[eb >> 3] & (1 << (eb & 7)); }
+    inline void clearDirty() {
+        if (!dirtyL2P) return;
+        bzero(dirtyL2P, (flashLBAs + 7) / 8);
+        bzero(dirtyPe, (eraseBlocks + 7) / 8);
+        dirtyL2Pcount = 0;
+        dirtyPecount = 0;
+    }
+    inline int pagesPerEB() { return ebBytes / flashWriteBufferSize; }
+    inline int journalCapacityPages() { return journalEBs * pagesPerEB(); }
 
     // ---- L2P AND ERASE BLOCK MANAGEMENT
 
@@ -337,6 +546,10 @@ private:
 
     inline void setEBMeta(int eb) {
         setEBState(eb, ebMeta);
+    }
+
+    inline bool ebIsJournal(int eb) {
+        return getEBState(eb) == ebJournal;
     }
 
     inline uint16_t l2p_eb(int lba) {
@@ -844,6 +1057,9 @@ private:
             }
             highestPECount -= maxPEDiff;
             peCountOffset += maxPEDiff;
+            // Every peCount entry just changed; a delta record can't capture
+            // that compactly, so fold it into the next full snapshot.
+            journalNeedsSnapshot = true;
         }
         peCount[eb]++;
         if (peCount[eb] > highestPECount) {
@@ -851,6 +1067,7 @@ private:
         }
 
         setEBState(eb, 0);
+        markPe(eb);
     }
 
 
@@ -922,6 +1139,7 @@ private:
                     emptyEBs++;
                 }
                 l2p[i] = make_l2p(curIdx, destEB);
+                markL2P(i);
                 setEBState(destEB, getEBState(destEB) + 1);
                 curIdx++;
             }
@@ -931,7 +1149,7 @@ private:
 
     inline int gcScore(int eb) {
         unsigned int state = getEBState(eb);
-        if ((state == ebMeta) || !state) {
+        if ((state == ebMeta) || (state == ebJournal) || !state) {
             return 0;
         }
         int delta = highestPECount - peCount[eb];
@@ -952,8 +1170,8 @@ private:
         emptyEBs--;
         for (int cnt = 0; (getEBState(destEB) < 8) && (cnt < 8); cnt++) {   // Loop until full or at most 8 times since we should have at least 1 move per cycle
             static int eb = 0; // The current EB to GC, we'll start at the last eb checked and loop around
-            // Find first non-meta EB
-            while (ebIsMeta(eb) || (eb == destEB)) {
+            // Find first non-meta, non-journal EB
+            while (ebIsMeta(eb) || ebIsJournal(eb) || (eb == destEB)) {
                 eb = (eb + 1) % eraseBlocks;
             }
             ebScore = gcScore(eb);
@@ -995,11 +1213,23 @@ private:
                 setEBState(eb, 0);
                 setEBMeta(destEB);
                 metaEBList[i] = destEB;
+                // The metadata EB list moved; the delta journal references a
+                // base snapshot whose ebState no longer matches, so force a
+                // fresh snapshot at the next persist to re-anchor.
+                journalNeedsSnapshot = true;
             }
         }
     }
 
     int selectBestEB() {
+        // Near-full guard: if the journal ring is holding blocks GC may need to
+        // keep its 3-block reserve, release it first (folding its deltas into a
+        // snapshot). Done before the GC loop below so emptyEBs can actually
+        // reach its target instead of spinning against the ring.
+        if (_journal && journalBaseValid && !journalSuspended &&
+            (emptyEBs <= journalSuspendBelow)) {
+            suspendJournalUnderPressure();
+        }
         int ebScore = 0;
         // We need 3 EBs minimum to be free, and any score > 10 means we need to move for PE count wear leveling
         while ((emptyEBs < 3) || (ebScore > 10)) {
@@ -1015,5 +1245,265 @@ private:
         return eb;
     }
 
+
+    // ----- DELTA JOURNAL
+    //
+    // On-flash journal page layout (one page == flashWriteBufferSize bytes,
+    // the minimum program unit; 256 B on RP2040 hardware). Each page is a
+    // self-contained, atomically-programmed record:
+    //
+    //   [0]    "JRNL"            signature (4 B)
+    //   [4]    baseEpoch (u32)   snapshot epoch this delta extends
+    //   [8]    recordSeq (u32)   monotonic page index within the cycle
+    //   [12]   subIndex (u8)     reserved (always 0 in this implementation)
+    //   [13]   subTotal (u8)     reserved (always 1: single-page records)
+    //   [14]   highestPECount (u16)
+    //   [16]   peCountOffset (u32)
+    //   [20]   nL2P (u16)        count of changed L2P entries
+    //   [22]   nPe  (u16)        count of changed peCount entries
+    //   [24]   nL2P x {lba:u16, l2p:u16} then nPe x {eb:u16, pe:u8}
+    //   [pb-4] crc32 over bytes [0 .. pb-4)
+    //
+    // A delta that does not fit in one page falls back to a full snapshot, so
+    // every journal record is exactly one program with no erase. ebState is
+    // NOT journaled: its per-EB valid counts are recomputed from the L2P map
+    // on boot (recomputeDerivedState), keeping records minimal.
+    static const int JHDR = 24;
+
+    bool journalPersist() {
+        // Suspended (released the ring under pressure): rebuild it only if free
+        // space has recovered past the hysteresis high-water mark; otherwise
+        // just take a plain full snapshot (exactly upstream behavior).
+        if (journalSuspended) {
+            if (emptyEBs >= journalResumeAbove) {
+                return doFullSnapshot();   // will re-allocate the ring
+            }
+            bool ret = doPersist();        // full snapshot captures everything...
+            clearDirty();                  // ...so the delta set resets too
+            _fi->serialize();
+            return ret;
+        }
+        if (!journalBaseValid || journalNeedsSnapshot) {
+            return doFullSnapshot();
+        }
+        if (!dirtyL2Pcount && !dirtyPecount) {
+            return true; // nothing changed since last record
+        }
+        int need = JHDR + 4 * dirtyL2Pcount + 3 * dirtyPecount + 4 /* crc */;
+        if (need > flashWriteBufferSize) {
+            return doFullSnapshot(); // delta too big for one page
+        }
+        if ((int)journalSeq >= journalCapacityPages()) {
+            return doFullSnapshot(); // ring full
+        }
+        buildAndProgramJournalPage();
+        clearDirty();
+        metadataAge = 0;
+        _fi->serialize();
+        return true;
+    }
+
+    bool doFullSnapshot() {
+        freeOldJournal();                 // release any current ring back to the pool
+        bool haveRing = tryAllocateJournal(); // carve a fresh ring iff there's room
+        bool ret = doPersist();           // bumps epoch, writes snapshot (records ring iff haveRing)
+        journalSeq = 0;
+        clearDirty();
+        journalNeedsSnapshot = false;
+        journalBaseValid = haveRing;
+        journalSuspended = !haveRing;     // no room -> stay in full-snapshot mode
+        _fi->serialize();
+        return ret;
+    }
+
+    void freeOldJournal() {
+        for (int i = 0; i < journalEBs; i++) {
+            int eb = journalEBList[i];
+            if (eb >= 0) {
+                setEBState(eb, 0);
+                emptyEBs++;
+                journalEBList[i] = -1;
+            }
+        }
+    }
+
+    // Carve `journalEBs` blocks for the ring, but only if doing so still leaves
+    // GC its 3-block reserve. Returns false (ring not allocated) when the
+    // volume is too full - the caller then runs in full-snapshot mode.
+    bool tryAllocateJournal() {
+        if (emptyEBs < journalEBs + 3) {
+            return false;
+        }
+        int picked[journalEBs];
+        for (int i = 0; i < journalEBs; i++) {
+            int eb = lowestEmptyEB();
+            if (eb < 0) { // shouldn't happen given the check above; be safe
+                // roll back any we already marked
+                for (int k = 0; k < i; k++) { setEBState(picked[k], 0); emptyEBs++; }
+                return false;
+            }
+            setEBState(eb, ebJournal); // reserve so next lowestEmptyEB() skips it
+            emptyEBs--;
+            picked[i] = eb;
+        }
+        // Insertion sort ascending so physical fill order is deterministic and
+        // reproducible from an ebState scan on boot (journalEBs is tiny).
+        for (int i = 1; i < journalEBs; i++) {
+            int v = picked[i], j = i - 1;
+            while (j >= 0 && picked[j] > v) { picked[j + 1] = picked[j]; j--; }
+            picked[j + 1] = v;
+        }
+        for (int i = 0; i < journalEBs; i++) {
+            journalEBList[i] = picked[i];
+            eraseEB(picked[i]);             // blank it for append-only programming
+            setEBState(picked[i], ebJournal); // eraseEB() cleared the nibble; re-mark
+        }
+        journalSeq = 0;
+        return true;
+    }
+
+    // Called from the allocation path when free blocks get low: fold the
+    // current state (snapshot + applied deltas) into a fresh snapshot, hand the
+    // ring's blocks back to the pool, and switch to full-snapshot mode until
+    // space recovers. This keeps GC's free-block reserve available.
+    void suspendJournalUnderPressure() {
+        doPersist();          // fold everything into a durable snapshot (no ring written)
+        freeOldJournal();     // give the ring's blocks back -> emptyEBs += journalEBs
+        journalSeq = 0;
+        clearDirty();
+        journalBaseValid = false;
+        journalSuspended = true;
+        journalNeedsSnapshot = false;
+        _fi->serialize();
+    }
+
+    void buildAndProgramJournalPage() {
+        uint8_t pg[flashWriteBufferSize];
+        bzero(pg, flashWriteBufferSize);
+        memcpy(pg, journalSig, 4);
+        uint32_t be = metadataEpoch;
+        memcpy(pg + 4, &be, 4);
+        uint32_t seq = journalSeq;
+        memcpy(pg + 8, &seq, 4);
+        pg[12] = 0;
+        pg[13] = 1;
+        uint16_t hpc = (uint16_t)highestPECount;
+        memcpy(pg + 14, &hpc, 2);
+        uint32_t pco = (uint32_t)peCountOffset;
+        memcpy(pg + 16, &pco, 4);
+        uint8_t *p = pg + JHDR;
+        uint16_t nL2P = 0, nPe = 0;
+        for (int lba = 0; lba < flashLBAs; lba++) {
+            if (testL2P(lba)) {
+                uint16_t l = (uint16_t)lba;
+                uint16_t v = (uint16_t)l2p[lba];
+                memcpy(p, &l, 2); p += 2;
+                memcpy(p, &v, 2); p += 2;
+                nL2P++;
+            }
+        }
+        for (int eb = 0; eb < eraseBlocks; eb++) {
+            if (testPe(eb)) {
+                uint16_t e = (uint16_t)eb;
+                memcpy(p, &e, 2); p += 2;
+                *p++ = peCount[eb];
+                nPe++;
+            }
+        }
+        memcpy(pg + 20, &nL2P, 2);
+        memcpy(pg + 22, &nPe, 2);
+        MetadataCRC32 c;
+        c.add(pg, flashWriteBufferSize - 4);
+        uint32_t crc = c.get();
+        memcpy(pg + flashWriteBufferSize - 4, &crc, 4);
+
+        int ebSlot = journalSeq / pagesPerEB();
+        int off = (journalSeq % pagesPerEB()) * flashWriteBufferSize;
+#if FTL_DEBUG
+        printf("journal page seq %d -> eb %d off %d (%d l2p, %d pe)\n",
+               (int)journalSeq, journalEBList[ebSlot], off, nL2P, nPe);
+#endif
+        _fi->program(journalEBList[ebSlot], off, pg, flashWriteBufferSize);
+        journalSeq++;
+    }
+
+    bool validJournalPage(const uint8_t *pg, uint32_t expectSeq) {
+        if (memcmp(pg, journalSig, 4)) return false; // blank or not a record
+        uint32_t be; memcpy(&be, pg + 4, 4);
+        if (be != metadataEpoch) return false;       // belongs to an older cycle
+        uint32_t seq; memcpy(&seq, pg + 8, 4);
+        if (seq != expectSeq) return false;           // gap (torn tail)
+        MetadataCRC32 c;
+        c.add(pg, flashWriteBufferSize - 4);
+        uint32_t crc = c.get();
+        uint32_t stored; memcpy(&stored, pg + flashWriteBufferSize - 4, 4);
+        return crc == stored;
+    }
+
+    void applyJournalPage(const uint8_t *pg) {
+        uint16_t hpc; memcpy(&hpc, pg + 14, 2); highestPECount = hpc;
+        uint32_t pco; memcpy(&pco, pg + 16, 4); peCountOffset = pco;
+        uint16_t nL2P; memcpy(&nL2P, pg + 20, 2);
+        uint16_t nPe; memcpy(&nPe, pg + 22, 2);
+        const uint8_t *p = pg + JHDR;
+        for (int i = 0; i < nL2P; i++) {
+            uint16_t lba; memcpy(&lba, p, 2); p += 2;
+            uint16_t v; memcpy(&v, p, 2); p += 2;
+            l2p[lba] = v;
+        }
+        for (int i = 0; i < nPe; i++) {
+            uint16_t eb; memcpy(&eb, p, 2); p += 2;
+            uint8_t pe = *p++;
+            peCount[eb] = pe;
+        }
+    }
+
+    int scanJournalList() {
+        int j = 0;
+        for (int i = 0; i < journalEBs; i++) journalEBList[i] = -1;
+        for (int eb = 0; (eb < eraseBlocks) && (j < journalEBs); eb++) {
+            if (ebIsJournal(eb)) journalEBList[j++] = eb;
+        }
+        return j;
+    }
+
+    void replayJournal() {
+        journalSeq = 0;
+        int cap = journalCapacityPages();
+        for (int pageIdx = 0; pageIdx < cap; pageIdx++) {
+            int ebSlot = pageIdx / pagesPerEB();
+            int off = (pageIdx % pagesPerEB()) * flashWriteBufferSize;
+            int eb = journalEBList[ebSlot];
+            if (eb < 0) break;
+            const uint8_t *pg = _fi->readEB(eb) + off;
+            if (!validJournalPage(pg, (uint32_t)pageIdx)) break; // first blank/torn page ends replay
+            applyJournalPage(pg);
+            journalSeq = pageIdx + 1;
+        }
+    }
+
+    // After loading a snapshot and replaying the journal, the L2P map is
+    // current but ebState's per-EB valid counts (and the derived scalars)
+    // reflect only the snapshot. Rebuild them from the L2P map, preserving the
+    // meta and journal block markers.
+    void recomputeDerivedState() {
+        for (int eb = 0; eb < eraseBlocks; eb++) {
+            if (!ebIsMeta(eb) && !ebIsJournal(eb)) setEBState(eb, 0);
+        }
+        validLBAs = 0;
+        for (int lba = 0; lba < flashLBAs; lba++) {
+            if (l2p_val(lba)) {
+                int eb = l2p_eb(lba);
+                if (!ebIsMeta(eb) && !ebIsJournal(eb)) setEBState(eb, getEBState(eb) + 1);
+                validLBAs++;
+            }
+        }
+        emptyEBs = 0;
+        highestPECount = 0;
+        for (int eb = 0; eb < eraseBlocks; eb++) {
+            if (getEBState(eb) == 0) emptyEBs++;
+            if (peCount[eb] > highestPECount) highestPECount = peCount[eb];
+        }
+    }
 
 };
