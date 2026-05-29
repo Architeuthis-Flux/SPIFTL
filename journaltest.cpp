@@ -349,6 +349,66 @@ static void scenarioNearFull() {
     printf("  done\n");
 }
 
+// Static-wear-leveling stressor: 1/4 of LBAs are written once (static data),
+// the other 3/4 are rewritten + persisted repeatedly (hot data). Returns the
+// total flash erases (sum of PE counts) and fills *spread with max-min PE.
+// `persistEach` mimics an f_close after every write.
+static long wearStress(bool journal, int writes, int* spread, int* mnOut, int* mxOut) {
+    freshFlash();
+    // 4 MB partition (1024 EBs, metaEBs=10) - representative of JumperlOS, and
+    // big enough that a full snapshot rewrites many metadata blocks (the cost
+    // the journal avoids). No cross-reboot here, so skip the disk serialize.
+    FlashInterfaceRAM fi(4 * 1024 * 1024);
+    fi.persistToDisk = false;
+    SPIFTL ftl(&fi, journal);
+    ftl.start();
+    int nLBA = ftl.lbaCount();
+    uint8_t buf[LBA_BYTES];
+    srand(99);
+    for (int i = 0; i < nLBA / 4; i++) { fillPattern(buf, i, 1); ftl.write(i, buf); }
+    for (int i = 0; i < writes; i++) {
+        int lba = nLBA / 4 + (rand() % ((nLBA * 3) / 4));
+        fillPattern(buf, lba, (i & 0x7f) + 1);
+        ftl.write(lba, buf);
+        ftl.persist();                  // every write is an f_close in this stressor
+    }
+    ftl.persist();
+    CHECK(ftl.check(), journal ? "check() wear journal-on" : "check() wear journal-off");
+    int ebs = ftl.ebCount();
+    int mn = 1 << 30, mx = 0; long sum = 0;
+    for (int i = 0; i < ebs; i++) {
+        int pe = ftl.getPECountOffset() + ftl.getPECount(i);
+        if (pe < mn) mn = pe;
+        if (pe > mx) mx = pe;
+        sum += pe;
+    }
+    if (spread) *spread = mx - mn;
+    if (mnOut) *mnOut = mn;
+    if (mxOut) *mxOut = mx;
+    return sum;
+}
+
+// Verify static wear leveling holds with journaling on, AND compare total
+// flash erases against the full-snapshot-per-persist (journal off) path - the
+// headline durability/endurance win of the journal.
+static void scenarioWearLevel(int writes) {
+    printf("Scenario H: wear leveling + erase comparison (%d write+persist cycles)\n", writes);
+    int spreadOn = 0, mnOn = 0, mxOn = 0, spreadOff = 0;
+    long erasesOff = wearStress(false, writes, &spreadOff, nullptr, nullptr);
+    long erasesOn  = wearStress(true,  writes, &spreadOn,  &mnOn, &mxOn);
+    CHECK(spreadOn  <= 64 + 1, "journal-on PE spread within maxPEDiff");
+    CHECK(spreadOff <= 64 + 1, "journal-off PE spread within maxPEDiff");
+    printf("    journal ON : total erases=%ld  PE min=%d max=%d spread=%d\n",
+           erasesOn, mnOn, mxOn, spreadOn);
+    printf("    journal OFF: total erases=%ld  spread=%d  (full snapshot every persist)\n",
+           erasesOff, spreadOff);
+    if (erasesOn > 0) {
+        printf("    -> journaling did %.1fx fewer flash erases for the same workload\n",
+               (double)erasesOff / (double)erasesOn);
+    }
+    printf("  done\n");
+}
+
 int main(int argc, char **argv) {
     int seed = (argc >= 2) ? atoi(argv[1]) : 12345;
     int churnOps = (argc >= 3) ? atoi(argv[2]) : 100000;
@@ -359,6 +419,7 @@ int main(int argc, char **argv) {
     scenarioTornTail();
     scenarioRollover();
     scenarioNearFull();
+    scenarioWearLevel(20000);
     scenarioChurn(seed, churnOps);
     remove("flash.bin");
     if (g_fail) {

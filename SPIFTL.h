@@ -315,10 +315,11 @@ public:
     bool isLazyPersist() const { return _lazyPersist; }
 
     // Opt-in delta-journal. Can only be ENABLED if the instance was
-    // constructed with journaling reserved (geometry + dirty bitsets);
-    // calling setJournal(true) on a non-reserved instance is ignored so we
-    // never journal without a reserved region. Disabling is always allowed
-    // and reverts persist()/forceSync() to full snapshots.
+    // constructed with journaling on (which allocates the dirty-tracking
+    // bitsets); calling setJournal(true) on an instance built with journal=
+    // false is ignored, since there are no bitsets to track deltas. Disabling
+    // is always allowed and reverts persist()/forceSync() to full snapshots.
+    // Note: geometry is identical either way, so toggling never reformats.
     void setJournal(bool enable) {
         if (enable && !dirtyL2P) {
             return; // Not reserved at construction; cannot enable.
@@ -1446,15 +1447,23 @@ private:
         uint16_t nL2P; memcpy(&nL2P, pg + 20, 2);
         uint16_t nPe; memcpy(&nPe, pg + 22, 2);
         const uint8_t *p = pg + JHDR;
+        // The CRC32 lives in the last 4 bytes; never read entries past it.
+        // Defense-in-depth: even though validJournalPage() verified the CRC,
+        // bounds-check the decoded indices so a (vanishingly unlikely) CRC
+        // collision or a page from a mismatched format can never scribble
+        // outside the l2p[] / peCount[] arrays.
+        const uint8_t *limit = pg + (flashWriteBufferSize - 4);
         for (int i = 0; i < nL2P; i++) {
+            if (p + 4 > limit) return;
             uint16_t lba; memcpy(&lba, p, 2); p += 2;
             uint16_t v; memcpy(&v, p, 2); p += 2;
-            l2p[lba] = v;
+            if (lba < flashLBAs) l2p[lba] = v;
         }
         for (int i = 0; i < nPe; i++) {
+            if (p + 3 > limit) return;
             uint16_t eb; memcpy(&eb, p, 2); p += 2;
             uint8_t pe = *p++;
-            peCount[eb] = pe;
+            if (eb < eraseBlocks) peCount[eb] = pe;
         }
     }
 

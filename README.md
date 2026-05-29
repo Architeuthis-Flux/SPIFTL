@@ -25,6 +25,52 @@ should only require developing a small FlashInterface subclass.
 This software is provided on an AS-IS basis and no comes with no warranties.
 See LICENSE.md for the full GNU LESSER GENERAL PUBLIC LICENSE.
 
+## How it works (static wear leveling)
+
+SPIFTL is a small **log-structured** flash translation layer. The flash is
+divided into 4 KB **erase blocks** (EBs); each EB holds eight 512-byte logical
+blocks (LBAs). The core data structures (all in RAM, serialized to flash as
+"metadata"):
+
+* **L2P map** - `l2p[lba]` -> `(eb, index, valid)` packed into a `uint16`. This
+  is the logical-to-physical mapping.
+* **`peCount[eb]`** - the program/erase count of each block (the wear counter).
+  It is an 8-bit value; when any block reaches 251 the FTL subtracts
+  `maxPEDiff` (64) from every counter and adds it to a global `peCountOffset`,
+  so the true erase count is `peCountOffset + peCount[eb]` and the byte never
+  overflows.
+* **`ebState[eb]`** - a nibble per block: `0` = free, `1..8` = number of valid
+  LBAs it holds, `0xf` = metadata block, `0xe` = journal block.
+
+**Writes are out-of-place.** A write never erases in place; it appends the new
+sector to the current *open* EB at the next free slot, updates `l2p[lba]` to
+point there, and marks the old slot invalid. When the open EB fills (8 slots)
+a new one is opened.
+
+**Garbage collection + wear leveling.** A new open EB is chosen by
+`selectBestEB()`, which keeps at least 3 free blocks available by running
+`garbageCollect()` and always writes into the **lowest-PE** (least-worn) free
+block. GC picks its victim with `gcScore()`, which blends two goals:
+
+* *Reclaim*: blocks with fewer valid LBAs are cheaper to evacuate (`8 - state`).
+* *Static wear leveling*: a block whose erase count lags the most-worn block by
+  `>= maxPEDiff` scores highest, so **cold/static data is forcibly relocated**
+  out of an under-worn block and that block is put back into rotation. Without
+  this, blocks holding data that never changes would never wear while hot
+  blocks burn out. This is what makes the leveling *static*, not just dynamic.
+
+The result is a hard bound: across the whole device, `max(peCount) -
+min(peCount) <= maxPEDiff` (64). Measured over 1,000,000 random writes to a
+256 KB image (64 EBs), every block lands within a **~54-count spread around
+~14,000 erases** - i.e. wear is spread essentially perfectly evenly (see
+`staticwearleveltest.cpp`).
+
+**Metadata** (L2P + peCount + ebState) is itself written to a rotating set of
+metadata EBs, epoch-tagged and CRC32-protected, double-buffered so a torn write
+always leaves a previous good copy. Those metadata blocks age out and relocate
+via the same wear-leveling machinery (`metaAgeRewrite()`), so the metadata
+region is not a wear hot spot either.
+
 ## Lazy Persist Mode (Architeuthis-Flux fork)
 
 This fork adds an opt-in **lazy persist** mode that decouples metadata
@@ -165,98 +211,52 @@ capacity. Zero cost - geometry or memory - when journaling is off.
 
 ### Tests
 
-`make journaltest` builds and runs crash-recovery / durability tests
-(`journaltest.cpp`) against the RAM flash emulator. `-DSPIFTL_RAM_STRICT`
+`make journaltest` builds and runs the crash-recovery / durability / wear
+suite (`journaltest.cpp`) against the RAM flash emulator. `-DSPIFTL_RAM_STRICT`
 makes the emulator model real NOR (erase -> `0xFF`, program can only clear
-bits) so a "program over a non-erased page" bug is caught.
+bits) so a "program over a non-erased page" bug is caught. Scenarios:
 
+* A - basic durability across a reboot (write, persist, reboot, verify).
+* B - overwrites + trims survive a reboot.
+* C - a write with no following `persist()` is correctly lost on power cut.
+* D - a torn final journal page (bad CRC) reverts to the last good persist.
+* E - snapshot rollover when the ring fills.
+* G - fill to capacity (journal suspends, GC keeps working), then free + resume.
+* H - static wear leveling holds with journaling on, vs. erase count off.
+* F - 100k random write/trim ops with GC + journal, verified across a reboot.
 
+`make statictest` runs the upstream 1,000,000-write wear-leveling soak.
 
+## Measured results
 
+Persist latency on a real **W25Q128JV** (RP2350, 4 MB FatFS partition), saving
+a ~1 KB breadboard slot file (the JumperlOS workload):
 
+| metric                         | full snapshot (old) | delta-journal (new) |
+|--------------------------------|---------------------|---------------------|
+| metadata `persist()` per save  | ~750 ms             | **~2.3 ms**         |
+| flash erases per `persist()`   | ~5 metadata EBs     | **0** (page append) |
+| power-loss durable per f_close | only via deferral   | **yes, every save** |
+| reformat to enable             | n/a                 | **none**            |
 
-### Old system on JumperlOS
+That ~2.3 ms is the actual on-device number (`[SPIFTL] persist 2293 us
+journal-append`); the metadata persist went from dominating a save to noise.
+(The remaining ~15-80 ms of a slot save is the FatFS data write itself -
+sector programs + dir/FAT update - which the journal does not change; embedders
+that save on every UI event should still defer/coalesce that at the app layer.)
 
-```
-	 connect nodes
+Endurance + wear, from scenario H (4 MB image, 20k write+persist cycles, 1/4
+static + 3/4 hot data):
 
-    10  -  15           connected
+| metric                    | journal off (snapshot/persist) | journal on |
+|---------------------------|--------------------------------|------------|
+| total flash erases        | 268,403                        | **175,663** (1.5x fewer) |
+| PE-count spread (max-min) | 59                             | 59 (`maxPEDiff` = 64) |
 
+Both modes hold the static-wear-leveling bound; journaling does **1.5x fewer
+total erases** for this write-heavy stressor (the metadata-erase component
+specifically drops ~50x - it's the data-sector writes, unchanged by the
+journal, that dominate the remainder). The journal ring rotates through the
+free pool and is not a wear hot spot.
 
-[17796 c0] FC> write entry path=/slots/slot0.yaml size=758
-[17796 c0] FC> core_sync acquire @write
-[17797 c0] FC> core_sync acquired @write
-[17797 c0] FC> write ensureCapacity needed=758 currentCap=1024
-[17797 c0] FC> write memcpy
-[17797 c0] FC> core_sync release @write
-[17798 c0] FC> write exit OK ver=2
-[17901 c0] FC> core_sync acquire @flushService/snap
-[17901 c0] FC> core_sync acquired @flushService/snap
-[17901 c0] FC> core_sync release @flushService/snap
-[18251 c0] FC> core_sync acquire @flushService/snap
-[21068 c0] FC> core_sync release @flushService/snap
-[21068 c0] FC> flushService -> canonical write /slots/slot0.yaml (758 bytes)
-[21071 c0] FC> flushEntryChunked pause acquired in 0ms
-[21071 c0] FC.atomic> ABA step 1: write canonical /slots/slot0.yaml (758 bytes)
-[21078 c0] FC> flushEntryChunked /slots/slot0.yaml wt=1 ok=1 (canon=1 bak=0) elapsed=9ms (Core1 paused for 7ms)
-[21080 c0] FC> flushService <- canonical write ok=1 (mirror will sync next tick)
-[21081 c0] FC> core_sync acquire @flushService/mark
-[21081 c0] FC> core_sync acquired @flushService/mark
-[21081 c0] FC> core_sync release @flushService/mark
-[21081 c0] FC> flushService DONE wrote /slots/slot0.yaml
-[22122 c0] FC> flushService mirror-sync /slots/slot0.yaml flushed=2 mirrored=1
-[22123 c0] FC> flushEntryMirror ENTER path=/slots/slot0.yaml flushed=2 mirrored=1
-[22125 c0] FC> flushEntryChunked pause acquired in 0ms
-[22126 c0] FC.atomic> ABA step 2: mirror to /.bak/slots/slot0.yaml (758 bytes)
-[22187 c0] FC> flushEntryChunked /slots/slot0.yaml wt=2 ok=1 (canon=0 bak=1) elapsed=64ms (Core1 paused for 62ms)
-[22188 c0] FC> flushEntryMirror EXIT path=/slots/slot0.yaml ok=1
-[23176 c0] FC> flushService spiftl-meta-sync bursts=2 age=2095ms
-[23176 c0] FC> metaSync ENTER reason=idle-tick bursts=2 age=2096ms
-[23840 c0] FC> metaSync EXIT ok=1 drained=2 remaining=0 (Core1 paused for 662ms, total 662ms)
-```
-
-
-### With new SPIFTL stuff
-
-```
-	 connect nodes
-
-     6  -  13           connected
-    19  -  23           connected
-[44978 c0] FC> write entry path=/slots/slot0.yaml size=1122
-[44979 c0] FC> core_sync acquire @write
-[44979 c0] FC> core_sync acquired @write
-[44979 c0] FC> write ensureCapacity needed=1122 currentCap=2048
-[44980 c0] FC> write memcpy
-[44980 c0] FC> core_sync release @write
-[44980 c0] FC> write exit OK ver=3
-[45165 c0] FC> core_sync acquire @flushService/snap
-[45166 c0] FC> core_sync acquired @flushService/snap
-[45166 c0] FC> core_sync release @flushService/snap
-[45518 c0] FC> core_sync acquire @flushService/snap
-[45518 c0] FC> core_sync acquired @flushService/snap
-[45518 c0] FC> core_sync release @flushService/snap
-[45869 c0] FC> core_sync acquire @flushService/snap
-[45869 c0] FC> core_sync acquired @flushService/snap
-[45870 c0] FC> core_sync release @flushService/snap
-[46221 c0] FC> core_sync acquire @flushService/snap
-[46222 c0] FC> core_sync acquired @flushService/snap
-[46222 c0] FC> core_sync release @flushService/snap
-[46223 c0] FC> flushService -> canonical write /slots/slot0.yaml (1122 bytes)
-[46226 c0] FC> flushEntryChunked pause acquired in 0ms
-[46226 c0] FC.atomic> ABA step 1: write canonical /slots/slot0.yaml (1122 bytes)
-[SPIFTL] persist 2344 us  journal-append (journal=1 epoch=13 recs=1)
-[46296 c0] FC> flushEntryChunked /slots/slot0.yaml wt=1 ok=1 (canon=1 bak=0) elapsed=72ms (Core1 paused for 70ms)
-[46296 c0] FC> flushService <- canonical write ok=1 (mirror will sync next tick)
-[46297 c0] FC> core_sync acquire @flushService/mark
-[46297 c0] FC> core_sync acquired @flushService/mark
-[46298 c0] FC> core_sync release @flushService/mark
-[46298 c0] FC> flushService DONE wrote /slots/slot0.yaml
-[47276 c0] FC> flushService mirror-sync /slots/slot0.yaml flushed=3 mirrored=2
-[47277 c0] FC> flushEntryMirror ENTER path=/slots/slot0.yaml flushed=3 mirrored=2
-[47279 c0] FC> flushEntryChunked pause acquired in 0ms
-[47279 c0] FC.atomic> ABA step 2: mirror to /.bak/slots/slot0.yaml (1122 bytes)
-[SPIFTL] persist 2285 us  journal-append (journal=1 epoch=13 recs=2)
-[47293 c0] FC> flushEntryChunked /slots/slot0.yaml wt=2 ok=1 (canon=0 bak=1) elapsed=16ms (Core1 paused for 14ms)
-```
 

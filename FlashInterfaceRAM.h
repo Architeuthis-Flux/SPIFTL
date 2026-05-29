@@ -57,7 +57,13 @@ public:
         return &_flash[eb * ebBytes];
     }
 
+    // Test hook: skip writing flash.bin on serialize(). Useful for throughput/
+    // wear measurements that don't need cross-"reboot" persistence, so a 4 MB
+    // image isn't flushed to disk on every persist().
+    bool persistToDisk = true;
+
     virtual void serialize() override {
+        if (!persistToDisk) return;
         FILE *f = fopen("flash.bin", "wb");
         if (f) {
             fwrite(_flash, 1, _flashSize, f);
